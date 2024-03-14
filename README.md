@@ -1,3 +1,5 @@
+> ⚠ Disclaimer: I do not own this repository, nor the contents within it. This is a custom fork of [Noxime/steamworks-rs](https://github.com/Noxime/steamworks-rs), created for use in Steam Achievement Notifier (V1.9). All credit, issues and otherwise should be directed to the owner of the original repository linked above.
+
 # steamworks
 [![crates.io](https://img.shields.io/crates/v/steamworks.svg)](https://crates.io/crates/steamworks)
 [![Documentation](https://docs.rs/steamworks/badge.svg)](https://docs.rs/steamworks)
