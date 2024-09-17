@@ -10,8 +10,8 @@ use super::*;
 /// # Example
 ///
 /// ```no_run
-/// # use steamworks::*;
-/// # let (client, single) = steamworks::Client::init().unwrap();
+/// use steamworks::Client;
+/// let client = Client::init().unwrap();
 /// // Unlock the 'WIN_THE_GAME' achievement
 /// client.user_stats().achievement("WIN_THE_GAME").set()?;
 /// # Err(())
@@ -107,8 +107,8 @@ impl<M> AchievementHelper<'_, M> {
     /// # Example
     ///
     /// ```no_run
-    /// # use steamworks::*;
-    /// # let (client, single) = steamworks::Client::init().unwrap();
+    /// use steamworks::Client;
+    /// let client = Client::init().unwrap();
     /// // Get the current unlock percentage for the 'WIN_THE_GAME' achievement
     /// client.user_stats().request_global_achievement_percentages(move|result| {
     ///     if !result.is_err() {
@@ -165,8 +165,8 @@ impl<M> AchievementHelper<'_, M> {
     /// # Example
     ///
     /// ```no_run
-    /// # use steamworks::*;
-    /// # let (client, single) = steamworks::Client::init().unwrap();
+    /// use steamworks::Client;
+    /// let client = Client::init().unwrap();
     /// // Get the "description" string for the 'WIN_THE_GAME' achievement
     /// client.user_stats().achievement("WIN_THE_GAME").get_achievement_display_attribute("desc").unwrap();
     /// # Err(())
