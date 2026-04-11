@@ -1,20 +1,22 @@
+#![doc = include_str!("../README.md")]
+
 #[macro_use]
 extern crate thiserror;
 #[macro_use]
 extern crate bitflags;
-#[macro_use]
-extern crate lazy_static;
 
+use screenshots::Screenshots;
 #[cfg(feature = "raw-bindings")]
 pub use steamworks_sys as sys;
 #[cfg(not(feature = "raw-bindings"))]
 use steamworks_sys as sys;
+use sys::{ ESteamAPIInitResult, SteamErrMsg};
 
 use core::ffi::c_void;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::{ CStr, CString};
 use std::fmt::{self, Debug, Formatter};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex };
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -23,14 +25,18 @@ pub use crate::app::*;
 pub use crate::callback::*;
 pub use crate::error::*;
 pub use crate::friends::*;
+pub use crate::timeline::*;
 pub use crate::user::*;
 pub use crate::user_stats::*;
 pub use crate::utils::*;
 
-mod app;
+#[macro_use]
 mod callback;
+mod app;
 mod error;
 mod friends;
+pub mod screenshots;
+pub mod timeline;
 mod user;
 mod user_stats;
 mod utils;
@@ -38,6 +44,14 @@ mod utils;
 pub type SResult<T> = Result<T, SteamError>;
 
 pub type SIResult<T> = Result<T, SteamAPIInitError>;
+
+pub(crate) fn to_steam_result(result: sys::EResult) -> SResult<()> {
+    if result == sys::EResult::k_EResultOK {
+        Ok(())
+    } else {
+        Err(result.into())
+    }
+}
 
 // A note about thread-safety:
 // The steam api is assumed to be thread safe unless
@@ -49,11 +63,11 @@ pub type SIResult<T> = Result<T, SteamAPIInitError>;
 ///
 /// This provides access to all of the steamworks api that
 /// clients can use.
-pub struct Client<Manager = ClientManager> {
-    inner: Arc<Inner<Manager>>,
+pub struct Client {
+    inner: Arc<Inner>,
 }
 
-impl<Manager> Clone for Client<Manager> {
+impl Clone for Client {
     fn clone(&self) -> Self {
         Client {
             inner: self.inner.clone(),
@@ -61,20 +75,96 @@ impl<Manager> Clone for Client<Manager> {
     }
 }
 
-struct Inner<Manager> {
-    _manager: Manager,
-    callbacks: Mutex<Callbacks>,
+struct Inner {
+    manager: Manager,
+    callbacks: Callbacks,
 }
 
 struct Callbacks {
-    callbacks: HashMap<i32, Box<dyn FnMut(*mut c_void) + Send + 'static>>,
-    call_results: HashMap<sys::SteamAPICall_t, Box<dyn FnOnce(*mut c_void, bool) + Send + 'static>>,
+    callbacks: Mutex<HashMap<i32, Box<dyn FnMut(*mut c_void) + Send + 'static>>>,
+    call_results:
+        Mutex<HashMap<sys::SteamAPICall_t, Box<dyn FnOnce(*mut c_void, bool) + Send + 'static>>>,
 }
 
-unsafe impl<Manager: Send + Sync> Send for Inner<Manager> {}
-unsafe impl<Manager: Send + Sync> Sync for Inner<Manager> {}
-unsafe impl<Manager: Send + Sync> Send for Client<Manager> {}
-unsafe impl<Manager: Send + Sync> Sync for Client<Manager> {}
+impl Inner {
+    /// Runs any currently pending callbacks
+    ///
+    /// This runs all currently pending callbacks on the current
+    /// thread.
+    ///
+    /// This should be called frequently (e.g. once per a frame)
+    /// in order to reduce the latency between recieving events.
+    pub fn run_callbacks(&self) {
+        self.run_callbacks_raw(|cb_discrim, data| {
+            let mut callbacks = self.callbacks.callbacks.lock().unwrap();
+            if let Some(cb) = callbacks.get_mut(&cb_discrim) {
+                cb(data);
+            }
+        });
+    }
+
+    /// Runs any currently pending callbacks.
+    ///
+    /// This is identical to `run_callbacks` in every way, except that
+    /// `callback_handler` is called for every callback invoked.
+    ///
+    /// This option provides an alternative for handling callbacks that
+    /// can doesn't require the handler to be `Send`, and `'static`.
+    ///
+    /// This should be called frequently (e.g. once per a frame)
+    /// in order to reduce the latency between recieving events.
+    pub fn process_callbacks(&self, mut callback_handler: impl FnMut(CallbackResult)) {
+        self.run_callbacks_raw(|cb_discrim, data| {
+            {
+                let mut callbacks = self.callbacks.callbacks.lock().unwrap();
+                if let Some(cb) = callbacks.get_mut(&cb_discrim) {
+                    cb(data);
+                }
+            }
+            let cb_result = unsafe { CallbackResult::from_raw(cb_discrim, data) };
+            if let Some(cb_result) = cb_result {
+                callback_handler(cb_result);
+            }
+        });
+    }
+
+    fn run_callbacks_raw(&self, mut callback_handler: impl FnMut(i32, *mut c_void)) {
+        unsafe {
+            let pipe = self.manager.get_pipe();
+            sys::SteamAPI_ManualDispatch_RunFrame(pipe);
+            let mut callback = std::mem::zeroed();
+            let mut apicall_result = Vec::new();
+            while sys::SteamAPI_ManualDispatch_GetNextCallback(pipe, &mut callback) {
+                if callback.m_iCallback == sys::SteamAPICallCompleted_t_k_iCallback as i32 {
+                    let apicall = callback
+                        .m_pubParam
+                        .cast::<sys::SteamAPICallCompleted_t>()
+                        .read_unaligned();
+                    apicall_result.resize(apicall.m_cubParam as usize, 0u8);
+                    let mut failed = false;
+                    if sys::SteamAPI_ManualDispatch_GetAPICallResult(
+                        pipe,
+                        apicall.m_hAsyncCall,
+                        apicall_result.as_mut_ptr().cast(),
+                        apicall.m_cubParam as _,
+                        apicall.m_iCallback,
+                        &mut failed,
+                    ) {
+                        let mut call_results = self.callbacks.call_results.lock().unwrap();
+                        // The &{val} pattern here is to avoid taking a reference to a packed field
+                        // Since the value here is Copy, we can just copy it and borrow the copy
+                        if let Some(cb) = call_results.remove(&{ apicall.m_hAsyncCall }) {
+                            cb(apicall_result.as_mut_ptr().cast(), failed);
+                        }
+                    }
+                } else {
+                    callback_handler(callback.m_iCallback, callback.m_pubParam.cast());
+                }
+                sys::SteamAPI_ManualDispatch_FreeLastCallback(pipe);
+            }
+        }
+    }
+}
 
 /// Returns true if the app wasn't launched through steam and
 /// begins relaunching it, the app should exit as soon as possible.
@@ -92,11 +182,11 @@ where
 {
 }
 
-impl Client<ClientManager> {
+impl Client {
     /// Call to the native SteamAPI_Init function.
     /// should not be used directly, but through either
     /// init_flat() or init_flat_app()
-    unsafe fn steam_api_init_flat(p_out_err_msg: *mut steamworks_sys::SteamErrMsg) -> steamworks_sys::ESteamAPIInitResult {
+    unsafe fn steam_api_init_flat(p_out_err_msg: *mut SteamErrMsg) -> ESteamAPIInitResult {
         unsafe { sys::SteamAPI_InitFlat(p_out_err_msg) }
     }
 
@@ -119,9 +209,9 @@ impl Client<ClientManager> {
     /// * The game isn't running on the same user/level as the steam client
     /// * The user doesn't own a license for the game.
     /// * The app ID isn't completely set up.
-    pub fn init() -> SIResult<Client<ClientManager>> {
-        static_assert_send::<Client<ClientManager>>();
-        static_assert_sync::<Client<ClientManager>>();
+    pub fn init() -> SIResult<Client> {
+        static_assert_send::<Client>();
+        static_assert_sync::<Client>();
         unsafe {
             let mut err_msg: sys::SteamErrMsg = [0; 1024];
             let result = Self::steam_api_init_flat(&mut err_msg);
@@ -132,16 +222,11 @@ impl Client<ClientManager> {
 
             sys::SteamAPI_ManualDispatch_Init();
             let client = Arc::new(Inner {
-                _manager: ClientManager { _priv: () },
-                callbacks: Mutex::new(Callbacks {
-                    callbacks: HashMap::new(),
-                    call_results: HashMap::new(),
-                }),
-                // networking_sockets_data: Mutex::new(NetworkingSocketsData {
-                //     sockets: Default::default(),
-                //     independent_connections: Default::default(),
-                //     connection_callback: Default::default(),
-                // }),
+                manager: Manager::Client,
+                callbacks: Callbacks {
+                    callbacks: Mutex::new(HashMap::new()),
+                    call_results: Mutex::new(HashMap::new()),
+                },
             });
             Ok(Client { inner: client })
         }
@@ -160,7 +245,7 @@ impl Client<ClientManager> {
     /// * The game isn't running on the same user/level as the steam client
     /// * The user doesn't own a license for the game.
     /// * The app ID isn't completely set up.
-    pub fn init_app<ID: Into<AppId>>(app_id: ID) -> SIResult<Client<ClientManager>> {
+    pub fn init_app<ID: Into<AppId>>(app_id: ID) -> SIResult<Client> {
         let app_id = app_id.into().0.to_string();
         std::env::set_var("SteamAppId", &app_id);
         std::env::set_var("SteamGameId", app_id);
@@ -168,10 +253,7 @@ impl Client<ClientManager> {
     }
 }
 
-impl<Manager> Client<Manager>
-where
-    Manager: crate::Manager,
-{
+impl Client {
     /// Runs any currently pending callbacks
     ///
     /// This runs all currently pending callbacks on the current
@@ -180,47 +262,36 @@ where
     /// This should be called frequently (e.g. once per a frame)
     /// in order to reduce the latency between recieving events.
     pub fn run_callbacks(&self) {
-        unsafe {
-            let pipe = Manager::get_pipe();
-            sys::SteamAPI_ManualDispatch_RunFrame(pipe);
-            let mut callback = std::mem::zeroed();
-            while sys::SteamAPI_ManualDispatch_GetNextCallback(pipe, &mut callback) {
-                let mut callbacks = self.inner.callbacks.lock().unwrap();
-                if callback.m_iCallback == sys::SteamAPICallCompleted_t_k_iCallback as i32 {
-                    let apicall =
-                        &mut *(callback.m_pubParam as *mut _ as *mut sys::SteamAPICallCompleted_t);
-                    let mut apicall_result = vec![0; apicall.m_cubParam as usize];
-                    let mut failed = false;
-                    if sys::SteamAPI_ManualDispatch_GetAPICallResult(
-                        pipe,
-                        apicall.m_hAsyncCall,
-                        apicall_result.as_mut_ptr() as *mut _,
-                        apicall.m_cubParam as _,
-                        apicall.m_iCallback,
-                        &mut failed,
-                    ) {
-                        // The &{val} pattern here is to avoid taking a reference to a packed field
-                        // Since the value here is Copy, we can just copy it and borrow the copy
-                        if let Some(cb) = callbacks.call_results.remove(&{ apicall.m_hAsyncCall }) {
-                            cb(apicall_result.as_mut_ptr() as *mut _, failed);
-                        }
-                    }
-                } else {
-                    if let Some(cb) = callbacks.callbacks.get_mut(&callback.m_iCallback) {
-                        cb(callback.m_pubParam as *mut _);
-                    }
-                }
-                sys::SteamAPI_ManualDispatch_FreeLastCallback(pipe);
-            }
-        }
+        self.inner.run_callbacks()
+    }
+
+    /// Runs any currently pending callbacks.
+    ///
+    /// This is identical to `run_callbacks` in every way, except that
+    /// `callback_handler` is called for every callback invoked.
+    ///
+    /// This option provides an alternative for handling callbacks that
+    /// can doesn't require the handler to be `Send`, and `'static`.
+    ///
+    /// This should be called frequently (e.g. once per a frame)
+    /// in order to reduce the latency between recieving events.
+    pub fn process_callbacks(&self, mut callback_handler: impl FnMut(CallbackResult)) {
+        self.inner.process_callbacks(&mut callback_handler)
     }
 
     /// Registers the passed function as a callback for the
     /// given type.
     ///
-    /// The callback will be run on the thread that `run_callbacks`
+    /// The callback will be run on the thread that [`run_callbacks`]
     /// is called when the event arrives.
-    pub fn register_callback<C, F>(&self, f: F) -> CallbackHandle<Manager>
+    ///
+    /// If the callback handler cannot be made `Send` or `'static`
+    /// the call to [`run_callbacks`] should be replaced with a call to
+    /// [`process_callbacks`] instead.
+    ///
+    /// [`run_callbacks`]: Self::run_callbacks
+    /// [`process_callbacks`]: Self::process_callbacks
+    pub fn register_callback<C, F>(&self, f: F) -> CallbackHandle
     where
         C: Callback,
         F: FnMut(C) + 'static + Send,
@@ -229,7 +300,7 @@ where
     }
 
     /// Returns an accessor to the steam utils interface
-    pub fn utils(&self) -> Utils<Manager> {
+    pub fn utils(&self) -> Utils {
         unsafe {
             let utils = sys::SteamAPI_SteamUtils_v010();
             debug_assert!(!utils.is_null());
@@ -241,7 +312,7 @@ where
     }
 
     /// Returns an accessor to the steam apps interface
-    pub fn apps(&self) -> Apps<Manager> {
+    pub fn apps(&self) -> Apps {
         unsafe {
             let apps = sys::SteamAPI_SteamApps_v008();
             debug_assert!(!apps.is_null());
@@ -253,9 +324,9 @@ where
     }
 
     /// Returns an accessor to the steam friends interface
-    pub fn friends(&self) -> Friends<Manager> {
+    pub fn friends(&self) -> Friends {
         unsafe {
-            let friends = sys::SteamAPI_SteamFriends_v017();
+            let friends = sys::SteamAPI_SteamFriends_v018();
             debug_assert!(!friends.is_null());
             Friends {
                 friends: friends,
@@ -265,7 +336,7 @@ where
     }
 
     /// Returns an accessor to the steam user interface
-    pub fn user(&self) -> User<Manager> {
+    pub fn user(&self) -> User {
         unsafe {
             let user = sys::SteamAPI_SteamUser_v023();
             debug_assert!(!user.is_null());
@@ -277,9 +348,9 @@ where
     }
 
     /// Returns an accessor to the steam user stats interface
-    pub fn user_stats(&self) -> UserStats<Manager> {
+    pub fn user_stats(&self) -> UserStats {
         unsafe {
-            let us = sys::SteamAPI_SteamUserStats_v012();
+            let us = sys::SteamAPI_SteamUserStats_v013();
             debug_assert!(!us.is_null());
             UserStats {
                 user_stats: us,
@@ -287,28 +358,56 @@ where
             }
         }
     }
-}
 
-/// Used to separate client and game server modes
-pub unsafe trait Manager {
-    unsafe fn get_pipe() -> sys::HSteamPipe;
-}
+    /// Returns an accessor to the steam screenshots interface
+    pub fn screenshots(&self) -> Screenshots {
+        unsafe {
+            let screenshots = sys::SteamAPI_SteamScreenshots_v003();
+            debug_assert!(!screenshots.is_null());
+            Screenshots {
+                screenshots,
+                _inner: self.inner.clone(),
+            }
+        }
+    }
 
-/// Manages keeping the steam api active for clients
-pub struct ClientManager {
-    _priv: (),
-}
+    /// Returns an accessor to the steam timeline interface
+    pub fn timeline(&self) -> Timeline {
+        unsafe {
+            let timeline = sys::SteamAPI_SteamTimeline_v004();
 
-unsafe impl Manager for ClientManager {
-    unsafe fn get_pipe() -> sys::HSteamPipe {
-        sys::SteamAPI_GetHSteamPipe()
+            Timeline {
+                timeline,
+                disabled: timeline.is_null(),
+                _inner: self.inner.clone(),
+            }
+        }
     }
 }
 
-impl Drop for ClientManager {
+/// Used to separate client and game server modes
+enum Manager {
+    Client,
+    // Server,
+}
+
+impl Manager {
+    /// Returns the pipe handle for the steam api
+    fn get_pipe(&self) -> sys::HSteamPipe {
+        match self {
+            Manager::Client => unsafe { sys::SteamAPI_GetHSteamPipe() },
+            // Manager::Server => unsafe { sys::SteamGameServer_GetHSteamPipe() },
+        }
+    }
+}
+
+impl Drop for Manager {
     fn drop(&mut self) {
-        unsafe {
-            sys::SteamAPI_Shutdown();
+        // SAFETY: This is considered unsafe only because of FFI, the function is otherwise
+        // always safe to call from any thread.
+        match self {
+            Manager::Client => unsafe { sys::SteamAPI_Shutdown() },
+            // Manager::Server => unsafe { sys::SteamGameServer_Shutdown() },
         }
     }
 }
@@ -333,6 +432,17 @@ impl SteamId {
     /// network or to a save format.
     pub fn raw(&self) -> u64 {
         self.0
+    }
+
+    /// Returns whether or not this Steam ID is invalid, which is when `account_type` is `k_EAccountTypeInvalid`.
+    pub fn is_invalid(&self) -> bool {
+        unsafe {
+            let bits = sys::CSteamID_SteamID_t {
+                m_unAll64Bits: self.0,
+            };
+            bits.m_comp.m_EAccountType()
+                == sys::EAccountType::k_EAccountTypeInvalid as std::os::raw::c_uint
+        }
     }
 
     /// Returns the account id for this steam id
@@ -418,6 +528,10 @@ mod tests {
     fn basic_test() {
         let client = Client::init().unwrap();
 
+        let _cb = client.register_callback(|p: PersonaStateChange| {
+            println!("Got callback: {:?}", p);
+        });
+
         let utils = client.utils();
         println!("Utils:");
         println!("AppId: {:?}", utils.app_id());
@@ -438,7 +552,7 @@ mod tests {
         let list = friends.get_friends(FriendFlags::IMMEDIATE);
         println!("{:?}", list);
         for f in &list {
-            println!("Friend: {:?} - {}", f.id(), f.name());
+            println!("Friend: {:?} - {}({:?})", f.id(), f.name(), f.state());
             friends.request_user_information(f.id(), true);
         }
         friends.request_user_information(SteamId(76561198174976054), true);

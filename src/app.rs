@@ -11,12 +11,12 @@ impl From<u32> for AppId {
 }
 
 /// Access to the steam apps interface
-pub struct Apps<Manager> {
+pub struct Apps {
     pub(crate) apps: *mut sys::ISteamApps,
-    pub(crate) _inner: Arc<Inner<Manager>>,
+    pub(crate) _inner: Arc<Inner>,
 }
 
-impl<Manager> Apps<Manager> {
+impl Apps {
     /// Returns whether the user currently has the app with the given
     /// ID currently installed.
     ///
@@ -156,4 +156,28 @@ impl<Manager> Apps<Manager> {
             command_line.to_string_lossy().into_owned()
         }
     }
+
+    /// Gets the associated launch parameter if the game is run via steam://run/<appid>/?param1=value1;param2=value2;param3=value3 etc.
+    ///
+    /// Parameter names starting with the character '@' are reserved for internal use and will always return an empty string.
+    /// Parameter names starting with an underscore '_' are reserved for steam features -- they can be queried by the game, but it is advised that you don't use param names beginning with an underscore for your own features.
+    ///
+    /// See [Steam API](https://partner.steamgames.com/doc/api/ISteamApps#GetLaunchQueryParam)
+    pub fn launch_query_param(&self, key: &str) -> String {
+        let key = CString::new(key).unwrap();
+        unsafe {
+            let value = sys::SteamAPI_ISteamApps_GetLaunchQueryParam(self.apps, key.as_ptr());
+            let value = CStr::from_ptr(value);
+            value.to_string_lossy().into_owned()
+        }
+    }
 }
+
+/// Called after the user executes a steam url with command line or query parameters such as steam://run/<appid>//?param1=value1;param2=value2;param3=value3; while the game is already running.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct NewUrlLaunchParameters;
+
+impl_callback!(_cb: NewUrlLaunchParameters_t => NewUrlLaunchParameters {
+    Self
+});

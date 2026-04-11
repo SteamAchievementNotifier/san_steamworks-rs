@@ -3,6 +3,7 @@ use super::*;
 bitflags! {
     #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
     #[repr(C)]
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
     pub struct FriendFlags: u16 {
         const NONE                  = 0x0000;
         const BLOCKED               = 0x0001;
@@ -22,6 +23,28 @@ bitflags! {
     }
 }
 
+bitflags! {
+    #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+    #[repr(C)]
+    #[derive(PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Clone, Copy)]
+    pub struct PersonaChange: i32 {
+        const NAME                = 0x0001;
+        const STATUS              = 0x0002;
+        const COME_ONLINE         = 0x0004;
+        const GONE_OFFLINE        = 0x0008;
+        const GAME_PLAYED         = 0x0010;
+        const GAME_SERVER         = 0x0020;
+        const AVATAR              = 0x0040;
+        const JOINED_SOURCE       = 0x0080;
+        const LEFT_SOURCE         = 0x0100;
+        const RELATIONSHIP_CHANGE = 0x0200;
+        const NAME_FIRST_SET      = 0x0400;
+        const FACEBOOK_INFO       = 0x0800;
+        const NICKNAME            = 0x1000;
+        const STEAM_LEVEL         = 0x2000;
+    }
+}
+
 pub enum OverlayToStoreFlag {
     None = 0,
     AddToCart = 1,
@@ -29,12 +52,12 @@ pub enum OverlayToStoreFlag {
 }
 
 /// Access to the steam friends interface
-pub struct Friends<Manager> {
+pub struct Friends {
     pub(crate) friends: *mut sys::ISteamFriends,
-    pub(crate) inner: Arc<Inner<Manager>>,
+    pub(crate) inner: Arc<Inner>,
 }
 
-impl<Manager> Friends<Manager> {
+impl Friends {
     /// Returns the (display) name of the current user
     pub fn name(&self) -> String {
         unsafe {
@@ -44,7 +67,7 @@ impl<Manager> Friends<Manager> {
         }
     }
 
-    pub fn get_friends(&self, flags: FriendFlags) -> Vec<Friend<Manager>> {
+    pub fn get_friends(&self, flags: FriendFlags) -> Vec<Friend> {
         unsafe {
             let count = sys::SteamAPI_ISteamFriends_GetFriendCount(self.friends, flags.bits() as _);
             if count == -1 {
@@ -63,8 +86,26 @@ impl<Manager> Friends<Manager> {
             friends
         }
     }
+    /// Returns recently played with players list
+    pub fn get_coplay_friends(&self) -> Vec<Friend> {
+        unsafe {
+            let count = sys::SteamAPI_ISteamFriends_GetCoplayFriendCount(self.friends);
+            if count == -1 {
+                return Vec::new();
+            }
+            let mut friends = Vec::with_capacity(count as usize);
+            for idx in 0..count {
+                let friend = SteamId(sys::SteamAPI_ISteamFriends_GetCoplayFriend(
+                    self.friends,
+                    idx,
+                ));
+                friends.push(self.get_friend(friend));
+            }
+            friends
+        }
+    }
 
-    pub fn get_friend(&self, friend: SteamId) -> Friend<Manager> {
+    pub fn get_friend(&self, friend: SteamId) -> Friend {
         Friend {
             id: friend,
             friends: self.friends,
@@ -81,10 +122,7 @@ impl<Manager> Friends<Manager> {
     pub fn activate_game_overlay(&self, dialog: &str) {
         let dialog = CString::new(dialog).unwrap();
         unsafe {
-            sys::SteamAPI_ISteamFriends_ActivateGameOverlay(
-                self.friends,
-                dialog.as_ptr() as *const _,
-            );
+            sys::SteamAPI_ISteamFriends_ActivateGameOverlay(self.friends, dialog.as_ptr());
         }
     }
 
@@ -94,8 +132,31 @@ impl<Manager> Friends<Manager> {
             let url = CString::new(url).unwrap();
             sys::SteamAPI_ISteamFriends_ActivateGameOverlayToWebPage(
                 self.friends,
-                url.as_ptr() as *const _,
+                url.as_ptr(),
                 sys::EActivateGameOverlayToWebPageMode::k_EActivateGameOverlayToWebPageMode_Default,
+            );
+        }
+    }
+
+    pub fn activate_game_overlay_to_store(
+        &self,
+        app_id: AppId,
+        overlay_to_store_flag: OverlayToStoreFlag,
+    ) {
+        unsafe {
+            let overlay_to_store_flag = match overlay_to_store_flag {
+                OverlayToStoreFlag::None => sys::EOverlayToStoreFlag::k_EOverlayToStoreFlag_None,
+                OverlayToStoreFlag::AddToCart => {
+                    sys::EOverlayToStoreFlag::k_EOverlayToStoreFlag_AddToCart
+                }
+                OverlayToStoreFlag::AddToCartAndShow => {
+                    sys::EOverlayToStoreFlag::k_EOverlayToStoreFlag_AddToCartAndShow
+                }
+            };
+            sys::SteamAPI_ISteamFriends_ActivateGameOverlayToStore(
+                self.friends,
+                app_id.0,
+                overlay_to_store_flag,
             );
         }
     }
@@ -105,26 +166,45 @@ impl<Manager> Friends<Manager> {
         unsafe {
             sys::SteamAPI_ISteamFriends_ActivateGameOverlayToUser(
                 self.friends,
-                dialog.as_ptr() as *const _,
+                dialog.as_ptr(),
                 user.0,
             );
         }
     }
 
-    /// Set rich presence for the user. Unsets the rich presence if `value` is None or empty.
-    /// See [Steam API](https://partner.steamgames.com/doc/api/ISteamFriends#SetRichPresence)
-    pub fn set_rich_presence(&self, key: &str, value: Option<&str>) -> bool {
+    /// Opens up an invite dialog that will send Rich Presence connect string to friends
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `connect` str contains a null byte.
+    pub fn activate_invite_dialog_connect_string(&self, connect: &str) {
+        let connect = CString::new(connect).unwrap();
         unsafe {
-            // Unwraps are infallible because Rust strs cannot contain null bytes
-            let key = CString::new(key).unwrap();
-            let value = CString::new(value.unwrap_or_default()).unwrap();
-            sys::SteamAPI_ISteamFriends_SetRichPresence(
+            sys::SteamAPI_ISteamFriends_ActivateGameOverlayInviteDialogConnectString(
                 self.friends,
-                key.as_ptr() as *const _,
-                value.as_ptr() as *const _,
-            )
+                connect.as_ptr(),
+            );
         }
     }
+
+    /// Set rich presence for the user. Unsets the rich presence if `value` is None or empty.
+    ///
+    /// See [Steam API](https://partner.steamgames.com/doc/api/ISteamFriends#SetRichPresence)
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `key` or `value` str slices contain a null byte.
+    pub fn set_rich_presence(&self, key: &str, value: Option<&str>) -> bool {
+        let key = CString::new(key).unwrap();
+        let value = value.map(|v| CString::new(v).unwrap());
+        let value_ptr = value
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value.as_ptr());
+        unsafe {
+            sys::SteamAPI_ISteamFriends_SetRichPresence(self.friends, key.as_ptr(), value_ptr)
+        }
+    }
+
     /// Clears all of the current user's Rich Presence key/values.
     pub fn clear_rich_presence(&self) {
         unsafe {
@@ -133,19 +213,75 @@ impl<Manager> Friends<Manager> {
     }
 }
 
-pub struct Friend<Manager> {
-    id: SteamId,
-    friends: *mut sys::ISteamFriends,
-    _inner: Arc<Inner<Manager>>,
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct PersonaStateChange {
+    pub steam_id: SteamId,
+    pub flags: PersonaChange,
 }
 
-impl<Manager> Debug for Friend<Manager> {
+impl_callback!(cb: PersonaStateChange_t => PersonaStateChange {
+    Self {
+        steam_id: SteamId(cb.m_ulSteamID),
+        flags: PersonaChange::from_bits_truncate(cb.m_nChangeFlags as i32),
+    }
+});
+
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GameOverlayActivated {
+    pub active: bool,
+}
+
+impl_callback!(cb: GameOverlayActivated_t => GameOverlayActivated {
+    Self {
+        active: cb.m_bActive == 1,
+    }
+});
+
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GameRichPresenceJoinRequested {
+    /// If you are joining a friend/being invited from a friend, this `SteamId` will be of said friend.
+    /// If it's not coming from a friend, this `SteamId` will be invalid, which you can check with the `.is_invalid()`
+    /// method.
+    pub friend_steam_id: SteamId,
+    /// the connect string, holding custom data to join a game or friend
+    pub connect: String,
+}
+
+impl_callback!(cb: GameRichPresenceJoinRequested_t => GameRichPresenceJoinRequested {
+    // Convert from &[i8] to &[u8] because c_char in C is signed.
+    // Technically, this C string does not have to be UTF-8, but I think for all realistic uses it will be.
+    let as_bytes = cb.m_rgchConnect.map(|c| c as u8);
+    let connect = CStr::from_bytes_until_nul(&as_bytes)
+        .expect("Connect string payload was not a valid C string");
+    let connect = connect
+        .to_str()
+        .expect("Connect string payload was not valid UTF-8")
+        .to_string();
+
+    let friend_steam_id = SteamId::from_raw(cb.m_steamIDFriend.m_steamid.m_unAll64Bits);
+
+    GameRichPresenceJoinRequested {
+        friend_steam_id,
+        connect,
+    }
+});
+
+pub struct Friend {
+    id: SteamId,
+    friends: *mut sys::ISteamFriends,
+    _inner: Arc<Inner>,
+}
+
+impl Debug for Friend {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "Friend({:?})", self.id)
     }
 }
 
-impl<Manager> Friend<Manager> {
+impl Friend {
     pub fn id(&self) -> SteamId {
         self.id
     }
@@ -161,6 +297,10 @@ impl<Manager> Friend<Manager> {
     pub fn nick_name(&self) -> Option<String> {
         unsafe {
             let name = sys::SteamAPI_ISteamFriends_GetPlayerNickname(self.friends, self.id.0);
+            if name.is_null() {
+                return None;
+            }
+
             let name = CStr::from_ptr(name);
             if name.is_empty() {
                 None
@@ -168,6 +308,36 @@ impl<Manager> Friend<Manager> {
                 Some(name.to_string_lossy().into_owned())
             }
         }
+    }
+
+    pub fn state(&self) -> FriendState {
+        unsafe {
+            let state = sys::SteamAPI_ISteamFriends_GetFriendPersonaState(self.friends, self.id.0);
+            match state {
+                sys::EPersonaState::k_EPersonaStateOffline => FriendState::Offline,
+                sys::EPersonaState::k_EPersonaStateOnline => FriendState::Online,
+                sys::EPersonaState::k_EPersonaStateInvisible => FriendState::Invisible,
+                sys::EPersonaState::k_EPersonaStateBusy => FriendState::Busy,
+                sys::EPersonaState::k_EPersonaStateAway => FriendState::Away,
+                sys::EPersonaState::k_EPersonaStateSnooze => FriendState::Snooze,
+                sys::EPersonaState::k_EPersonaStateLookingToPlay => FriendState::LookingToPlay,
+                sys::EPersonaState::k_EPersonaStateLookingToTrade => FriendState::LookingToTrade,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    /// Gets the app ID of the game that user played with someone on their recently-played-with list.
+    pub fn coplay_game_played(&self) -> AppId {
+        unsafe {
+            let app_id = sys::SteamAPI_ISteamFriends_GetFriendCoplayGame(self.friends, self.id.0);
+            AppId(app_id)
+        }
+    }
+
+    /// Gets the timestamp of when the user played with someone on their recently-played-with list.
+    pub fn coplay_time(&self) -> i32 {
+        unsafe { sys::SteamAPI_ISteamFriends_GetFriendCoplayTime(self.friends, self.id.0) }
     }
 
     /// Returns a small (32x32) avatar for the user in RGBA format
@@ -183,8 +353,6 @@ impl<Manager> Friend<Manager> {
             if !sys::SteamAPI_ISteamUtils_GetImageSize(utils, img, &mut width, &mut height) {
                 return None;
             }
-            assert_eq!(width, 32);
-            assert_eq!(height, 32);
             let mut dest = vec![0; 32 * 32 * 4];
             if !sys::SteamAPI_ISteamUtils_GetImageRGBA(utils, img, dest.as_mut_ptr(), 32 * 32 * 4) {
                 return None;
@@ -206,8 +374,6 @@ impl<Manager> Friend<Manager> {
             if !sys::SteamAPI_ISteamUtils_GetImageSize(utils, img, &mut width, &mut height) {
                 return None;
             }
-            assert_eq!(width, 64);
-            assert_eq!(height, 64);
             let mut dest = vec![0; 64 * 64 * 4];
             if !sys::SteamAPI_ISteamUtils_GetImageRGBA(utils, img, dest.as_mut_ptr(), 64 * 64 * 4) {
                 return None;
@@ -229,8 +395,6 @@ impl<Manager> Friend<Manager> {
             if !sys::SteamAPI_ISteamUtils_GetImageSize(utils, img, &mut width, &mut height) {
                 return None;
             }
-            assert_eq!(width, 184);
-            assert_eq!(height, 184);
             let mut dest = vec![0; 184 * 184 * 4];
             if !sys::SteamAPI_ISteamUtils_GetImageRGBA(utils, img, dest.as_mut_ptr(), 184 * 184 * 4)
             {
@@ -244,4 +408,54 @@ impl<Manager> Friend<Manager> {
     pub fn has_friend(&self, flags: FriendFlags) -> bool {
         unsafe { sys::SteamAPI_ISteamFriends_HasFriend(self.friends, self.id.0, flags.bits() as _) }
     }
+
+    /// Invites a friend or clan member to the current game using a special invite string.
+    /// If the target user accepts the invite then the ConnectString gets added to the command-line when launching the game.
+    /// If the game is already running for that user, then they will receive a GameRichPresenceJoinRequested_t callback with the connect string.
+    pub fn invite_user_to_game(&self, connect_string: &str) {
+        unsafe {
+            let connect_string = CString::new(connect_string).unwrap();
+            sys::SteamAPI_ISteamFriends_InviteUserToGame(
+                self.friends,
+                self.id.0,
+                connect_string.as_ptr(),
+            );
+        }
+    }
+
+    /// Mark a target user as 'played with'.
+    /// NOTE: The current user must be in game with the other player for the association to work.
+    pub fn set_played_with(&self) {
+        unsafe {
+            sys::SteamAPI_ISteamFriends_SetPlayedWith(self.friends, self.id.0);
+        }
+    }
+
+    /// Get a Rich Presence value from a specified friend.
+    pub fn rich_presence(&self, key: &str) -> Option<String> {
+        let key = CString::new(key).unwrap();
+        let value = unsafe {
+            sys::SteamAPI_ISteamFriends_GetFriendRichPresence(self.friends, self.id.0, key.as_ptr())
+        };
+        if value.is_null() {
+            return None;
+        }
+        let cstr = unsafe { CStr::from_ptr(value) };
+        if cstr.is_empty() {
+            return None;
+        }
+        Some(cstr.to_string_lossy().into_owned())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FriendState {
+    Offline,
+    Online,
+    Invisible,
+    Busy,
+    Away,
+    Snooze,
+    LookingToTrade,
+    LookingToPlay,
 }
