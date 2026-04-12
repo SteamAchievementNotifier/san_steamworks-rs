@@ -21,6 +21,12 @@ pub struct AchievementHelper<'parent> {
     pub(crate) parent: &'parent UserStats,
 }
 
+pub struct AchievementIcon {
+    pub handle: Vec<u8>,
+    pub width: u32,
+    pub height: u32
+}
+
 impl AchievementHelper<'_> {
     /// Gets the unlock status of the Achievement.
     ///
@@ -210,59 +216,47 @@ impl AchievementHelper<'_> {
     }
 
     /// Gets the icon for an achievement.
-    ///
+    /// 
     /// The image is returned as a handle to be used with `ISteamUtils::GetImageRGBA` to get
     /// the actual image data.*
-    ///
+    /// 
     /// **Note: This is handled within the function. Returns a `Vec<u8>` buffer on success,
-    /// which can be converted into the image data and saved to disk (e.g. via external RGBA to image crate).*
-    /// ** Note: This may return None if Steam has not retrieved the icon yet. In that case an `UserAchievementIconFetched` callback will be processed
-    pub fn get_achievement_icon(&self) -> Option<(Vec<u8>, u32, u32)> {
-        Some(self.internal_get_achievement_icon(true)?)
-    }
-
-    fn internal_get_achievement_icon(&self, avoid_big_icons: bool) -> Option<(Vec<u8>, u32, u32)> {
+    /// which can be converted into the image data and saved to disk (e.g. via external
+    /// "RGBA to image" crate).*
+    pub fn get_achievement_icon(&self) -> Option<AchievementIcon> {
         unsafe {
-            let utils: *mut sys::ISteamUtils = sys::SteamAPI_SteamUtils_v010();
+            let utils = sys::SteamAPI_SteamUtils_v010();
             let img = sys::SteamAPI_ISteamUserStats_GetAchievementIcon(
                 self.parent.user_stats,
-                self.name.as_ptr(),
+                self.name.as_ptr() as *const _,
             );
             if img == 0 {
-                return None;
+                return None
             }
             let mut width = 0;
             let mut height = 0;
-            if !sys::SteamAPI_ISteamUtils_GetImageSize(utils, img, &mut width, &mut height) {
-                return None;
+            if !sys::SteamAPI_ISteamUtils_GetImageSize(
+                utils, 
+                img, 
+                &mut width, 
+                &mut height
+            ) {
+                return None
             }
-            if avoid_big_icons && (width != 64 || height != 64) {
-                return None;
-            }
-            let mut dest = vec![0; (width * height * 4).try_into().unwrap()];
+            let mut dest = vec![0; (width as usize) * (height as usize) * 4];
             if !sys::SteamAPI_ISteamUtils_GetImageRGBA(
                 utils,
                 img,
                 dest.as_mut_ptr(),
-                (width * height * 4).try_into().unwrap(),
-            ) {
-                return None;
+                (width * height * 4) as i32
+                ) {
+                return None
             }
-            Some((dest, width, height))
+            Some(AchievementIcon {
+                handle: dest,
+                width,
+                height
+            })
         }
-    }
-
-    /// Gets the icon for an achievement.
-    ///
-    /// The image is returned as a handle to be used with `ISteamUtils::GetImageRGBA` to get
-    /// the actual image data.*
-    ///
-    /// **Note: This is handled within the function. Returns a `ImageBuffer::<image::Rgba<u8>, Vec<u8>>` from the image crate on success**
-    /// ** Note: This may return None if Steam has not retrieved the icon yet. In that case an `UserAchievementIconFetched` callback will be processed
-    #[cfg(feature = "image")]
-    pub fn get_achievement_icon_v2(&self) -> Option<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
-        let (vec, width, height) = self.internal_get_achievement_icon(false)?;
-        let img = image::ImageBuffer::<image::Rgba<u8>, Vec<u8>>::from_vec(width, height, vec)?;
-        return Some(img);
     }
 }
